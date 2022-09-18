@@ -1,5 +1,4 @@
 const functions = require("firebase-functions");
-const wiki = require('wikijs').default;
 const cors = require('cors')({origin: true});
 
 // // Create and Deploy Your First Cloud Functions
@@ -10,53 +9,116 @@ const cors = require('cors')({origin: true});
 //   response.send("Hello from Firebase!");
 // });
 
+var Discogs = require('disconnect').Client;
+var discogs = new Discogs({
+	consumerKey: "XMvqJbjJIIbRNOrPUAJz",
+	consumerSecret: "gTIJBkxhZQNtVVWMiwaxeDNxPfqYtYJI"
+});
 
-exports.getAlbums = functions.https.onRequest((request, response) => {
+function sanitizeString(str) {
+	return str.trimStart().trimEnd();
+}
+
+// Remove the number in parentheses
+function sanitizeName(name) {
+	const regex = /[\(|, ](\d+)[, \)]/;
+	return sanitizeString(name.replace(regex, ''));
+}
+
+exports.getReleases = functions.https.onRequest((request, response) => {
     cors(request, response, () => {
-        const query = request.query.artist + " discography"
-        const results = [];
-        wiki()
-            .page(query)
-            .then(page => page.links())
-            .then(res => { 
-                var loaded_data = 0;
-                for (i in res) {
-                    checkLink(res[i]).then(result => {
-                        loaded_data += 1;
-                        if (result != null) {
-                            results.push(result);
-                        }
-                        if (loaded_data == res.length) {
-                            response.status(200).send(results);
-                        }
-                    });
-                }
-            });
+        const query = request.query.artist;
+		const getReleases = new Promise((resolve, reject) => {
+			discogs.database().search(query, {type: "release"}, function(err, data){
+				if (err != null) {
+					reject(err);
+				} else {
+					const results = data.results.map((result) => {
+						const name_data = sanitizeString(result.title.split('-')[1]);
+						const artist_data = sanitizeName(result.title.split('-')[0]);
+						const imgURL_data = result.thumb;
+						const releaseDate_data = result.year;
+						const id_data = result.id;
+						return {name: name_data, artist: artist_data, imgURL: imgURL_data, releaseDate: releaseDate_data, id: id_data};
+					})
+					resolve(results);	
+				}
+			});
+		});
+
+		const getReleasesWithCredit = new Promise((resolve, reject) => {
+			discogs.database().search(null, {type: "release", credit: query}, function(err, data){
+				if (err != null) {
+					reject(err);
+				} else {
+					const results = data.results.map((result) => {
+						const name_data = sanitizeString(result.title.split('-')[1]);
+						const artist_data = sanitizeName(result.title.split('-')[0]);
+						const imgURL_data = result.thumb;
+						const releaseDate_data = result.year;
+						const id_data = result.id;
+						return {name: name_data, artist: artist_data, imgURL: imgURL_data, releaseDate: releaseDate_data, id: id_data};
+					})
+					resolve(results);	
+				}
+			});
+		})
+
+		return Promise.all([getReleases, getReleasesWithCredit])
+			.then(([result1, result2]) => { 
+				const allResults = [...result1, ...result2];
+
+				// Merge duplicate releases by release name only if they share the same artist
+				merged_dict = {};
+				for (const dict of allResults) {
+					const key = (dict.name).concat(dict.artist);
+					if (key in merged_dict) {
+						if (merged_dict[key].releaseDate > dict.releaseDate) {
+							merged_dict[key] = dict; // Keep the earlier year
+						}
+					} else {
+						merged_dict[key] = dict;
+					}
+				}
+
+				// Turn back into list of Objects
+				response.status(200).send(Object.keys(merged_dict).map((key) => { return merged_dict[key] }));
+				
+			})
+			.catch((e) => { response.status(500).send(e); });
     })
 });
 
-async function checkLink(linkTitle) {
-	return wiki()
-		.page(linkTitle)
-		.then(check_page => {
-			return check_page.info().then(check_res => {
-				return [check_res, check_page['fullurl']];
-			});
-		})
-		.then(([check_res, fullURL]) => {
-			if ('type' in check_res && (check_res['type'] == 'studio' || check_res['type'] == 'live')) {
-				return wiki()
-					.page(linkTitle)
-					.then(img_page => img_page.images())
-					.then(img_res => {
-						const matchedImgURL = img_res.find(img => img.split('.').pop() == "png" || img.split('.').pop() == "jpg");
-						return {'name': check_res['name'], 'artist' : check_res['artist'], 'imgURL' : matchedImgURL, 'releaseDate': check_res['released'].date, 'fullURL': fullURL};
+exports.getRelease = functions.https.onRequest((request, response) => {
+	cors(request, response, () => {
+		const releaseId = request.query.id;
+		const getRelease = new Promise((resolve, reject) => {
+			discogs.database().getRelease(releaseId, function(err, data) {
+				if (err != null) {
+					reject(err);
+				} else {
+					const results = data.extraartists.map((result) => {
+						return { name: sanitizeName(result.name), role: sanitizeString(result.role) }
 					});
-			} else {
-				return null;
-			}
-		}).catch((e) => {
-			return null;
-		});
-}
 
+					// Merge duplicate credits by name
+					merged_dict = {};
+					for (const dict of results) {
+						if (dict.name in merged_dict) {
+							merged_dict[dict.name].push(dict.role);
+						} else {
+							merged_dict[dict.name] = [dict.role];
+						}
+					}
+
+					// Turn back into list of Objects
+					resolve(Object.keys(merged_dict).map((key) => { return { name: key, roles: merged_dict[key] }}));
+				}
+			})
+		});
+
+		return getRelease	
+			.then(results => { response.status(200).send(results); })
+			.catch((e) => { response.status(500).send(e); });
+	})
+});
